@@ -8,7 +8,9 @@ import numpy as np
 import torch
 from model import AlexNet, ResNet18
 from train_util import get_model, train_model, get_results
-
+# EFC++ 用のインポート
+from gpm_proto_manager import ProtoManager
+from gpm_balance_head import balance_classifier
 
 def main(args):
     random.seed(args.seed)
@@ -52,6 +54,9 @@ def main(args):
         raise ValueError("Invalid dataset")
 
     criterion = torch.nn.CrossEntropyLoss()
+
+    # EFC++: プロトタイプマネージャーを初期化
+    proto_manager = ProtoManager(device, taskcla, args.batch_size_test)
 
     if args.method == "GPM":
         if args.dataset == "cifar100-10" or args.dataset == "cifar100-20":
@@ -387,6 +392,15 @@ def main(args):
                     importance_list,
                     Nullspace_alltask_list,
                 )
+            # --- 3. EFC++ プロトタイプ計算 ---
+            # (GPM基底更新の後)
+            print("EFC++: プロトタイプ計算中...")
+            proto_manager.compute_prototypes(model, data, task_id)
+            
+            # --- 4. EFC++ リバランシング ---
+            if task_id > 0:
+                # (argsに --lr_balance と --epochs_balance を追加する必要あり)
+                balance_classifier(args, model, proto_manager, data, task_id, taskcla)
 
         # save accuracy
         jj = 0
@@ -417,6 +431,19 @@ if __name__ == "__main__":
     parser.add_argument("--exp", type=str, default="test", help="Experiment name")
     parser.add_argument("--seed", type=int, default=1, metavar="S", help="random seed (default: 1)")
     parser.add_argument("--cuda", type=int, default=0, help="CUDA device number (default: 0)")
+    # EFC++ リバランシング用の引数を追加
+    parser.add_argument(
+        "--lr_balance",
+        type=float,
+        default=1e-3,
+        help="learning rate for EFC++ head re-balancing (default: 0.001)",
+    )
+    parser.add_argument(
+        "--epochs_balance",
+        type=int,
+        default=20,
+        help="number of epochs for EFC++ head re-balancing (default: 20)",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
