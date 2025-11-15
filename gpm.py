@@ -5,6 +5,52 @@ import torch.nn.functional as F
 from model import compute_conv_output_size
 
 
+def test_class_incremental(args, model, device, data, current_task_id, taskcla):
+    """
+    EFCのようにヘッドを結合してクラス増分学習として評価する関数
+    """
+    model.eval()
+    total_correct = 0
+    total_num = 0
+    
+    # クラス数のオフセット計算用リスト (例: [0, 10, 20, ...])
+    offsets = [0]
+    for i in range(len(taskcla)-1):
+        offsets.append(offsets[-1] + taskcla[i][1])
+
+    # これまでに学習した全タスクのテストデータで評価
+    with torch.no_grad():
+        for t in range(current_task_id + 1):
+            # タスク t のテストデータを取得
+            x = data[t]['test']['x'].to(device)
+            y = data[t]['test']['y'].to(device)
+            
+            # データローダーのラベル(0-9)をグローバルラベル(例: 10-19)に変換
+            y_global = y + offsets[t]
+            
+            # バッチごとに処理
+            r = np.arange(x.size(0))
+            for i in range(0, len(r), args.batch_size_test):
+                b = r[i : i + args.batch_size_test]
+                data_batch = x[b]
+                target_batch = y_global[b]
+                
+                # モデルの出力を取得（全タスクのリスト）
+                output_list = model(data_batch)
+                
+                # 現在のタスクまでのヘッドのみを結合 (Pseudo-Single Head化)
+                # output_list[:current_task_id+1] を結合 dim=1
+                output_global = torch.cat(output_list[:current_task_id+1], dim=1)
+                
+                # 全クラスの中で最大値を持つインデックスを取得
+                pred = output_global.argmax(dim=1, keepdim=True)
+                
+                total_correct += pred.eq(target_batch.view_as(pred)).sum().item()
+                total_num += len(b)
+
+    acc = 100.0 * total_correct / total_num
+    return acc
+
 def train(args, model, device, x, y, optimizer, criterion, task_id):
     model.train()
     r = np.arange(x.size(0))
