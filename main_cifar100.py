@@ -67,6 +67,7 @@ def main(args):
                 train_projected,
                 update_GPM,
                 test_class_incremental,
+                test_class_incremental_nme,
             )
         elif args.dataset == "miniimagenet":
             from gpm import (
@@ -76,6 +77,7 @@ def main(args):
                 train_projected_Resnet18,
                 update_GPM,
                 test_class_incremental,
+                test_class_incremental_nme,
             )
         else:
             raise ValueError("Invalid dataset")
@@ -340,11 +342,11 @@ def main(args):
                 # Test
                 test_loss, test_acc = test(args, model, device, xtest, ytest, criterion, task_id)
                 print("Test: loss={:.3f}, acc={:.2f}%".format(test_loss, test_acc))
-                print("Compute Class Incremental Accuracy (Pseudo-Single Head)...")
+                """print("Compute Class Incremental Accuracy (Pseudo-Single Head)...")
                 if args.method == "GPM" or args.method == "GPCNS" or args.method == "SGP":
                     # gpm.py または該当するファイルに追加した関数を呼び出す
                     cil_acc = test_class_incremental(args, model, device, data, task_id, taskcla)
-                    print(f"Task {task_id} - CIL Accuracy: {cil_acc:.2f}%")
+                    print(f"Task {task_id} - CIL Accuracy: {cil_acc:.2f}%")"""
 
             # Memory Update
             if args.method == "GPM":
@@ -397,10 +399,10 @@ def main(args):
             print("EFC++: プロトタイプ計算中...")
             proto_manager.compute_prototypes(model, data, task_id)
             
-            # --- 4. EFC++ リバランシング ---
+            """# --- 4. EFC++ リバランシング ---
             if task_id > 0:
                 # (argsに --lr_balance と --epochs_balance を追加する必要あり)
-                balance_classifier(args, model, proto_manager, data, task_id, taskcla)
+                balance_classifier(args, model, proto_manager, data, task_id, taskcla)"""
 
         # save accuracy
         jj = 0
@@ -412,7 +414,7 @@ def main(args):
         print("Compute Class Incremental Accuracy (Pseudo-Single Head)...")
         if args.method == "GPM" or args.method == "GPCNS" or args.method == "SGP":
             # gpm.py または該当するファイルに追加した関数を呼び出す
-            cil_acc = test_class_incremental(args, model, device, data, task_id, taskcla)
+            cil_acc = test_class_incremental_nme(args, model, device, data, task_id, taskcla,proto_manager)
             print(f"Task {task_id} - CIL Accuracy: {cil_acc:.2f}%")
         print("Accuracies =")
         for i in range(task_id + 1):

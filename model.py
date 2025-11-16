@@ -83,11 +83,12 @@ class AlexNet(nn.Module):
         self.act["fc2"] = x
         x = self.fc2(x)
         x = self.drop2(self.relu(self.bn5(x)))
+        features = x.clone()
         y = []
         for t, i in self.taskcla:
             y.append(self.fc3[t](x))
 
-        return y
+        return y,features
 
 
 ## Define ResNet18 model
