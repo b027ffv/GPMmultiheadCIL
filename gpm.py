@@ -4,6 +4,102 @@ import torch.nn.functional as F
 
 from model import compute_conv_output_size
 
+def analyze_head_outputs(args, model, device, data, current_task_id, taskcla):
+    """
+    教授の仮説を検証するための分析関数。
+    入力タスクごとに、各ヘッドの平均logit値と、
+    どのヘッド（グループ）が最大値を取ったかを計算し、行列で表示する。
+    """
+    model.eval()
+    
+    # オフセット計算（今回は使用しないが、構造把握のため）
+    offsets = [0]
+    for i in range(len(taskcla)-1):
+        offsets.append(offsets[-1] + taskcla[i][1])
+
+    num_tasks = current_task_id + 1
+    
+    # 分析結果を保存するリスト
+    all_head_means_list = [] # 各ヘッドの平均logit値
+    all_true_task_ids_list = [] # 入力画像の真のタスクID
+
+    print(f"\n--- [タスク {current_task_id}] ヘッド出力分析（教授の仮説検証）---")
+
+    with torch.no_grad():
+        # 1. 全テストデータをバッチ処理し、ヘッドごとの平均logitを収集
+        for t in range(num_tasks): # t = 真のタスクID
+            # タスク t のテストデータを取得
+            x = data[t]['test']['x'].to(device)
+            y = data[t]['test']['y'].to(device)
+            
+            r = np.arange(x.size(0))
+            for i in range(0, len(r), args.batch_size_test):
+                b = r[i : i + args.batch_size_test]
+                data_batch = x[b]
+                
+                # (y, features) を返すように修正済みの model.py を前提とする
+                output_list, _ = model(data_batch)
+                
+                # 現在のタスクまでのヘッドのみを対象
+                output_list_current = output_list[:num_tasks]
+                
+                # --- ここが仮説の核心 ---
+                # 各ヘッドの出力(例:[B, 10])の「平均値」を計算
+                # (B = バッチサイズ)
+                head_means = [torch.mean(head_output, dim=1) for head_output in output_list_current]
+                
+                # [B, num_tasks] のテンソルにまとめる
+                head_means_tensor = torch.stack(head_means, dim=1)
+                
+                all_head_means_list.append(head_means_tensor.cpu())
+                
+                # このバッチの真のタスクIDを保存
+                true_task_ids_batch = torch.full((len(data_batch),), fill_value=t, dtype=torch.long)
+                all_true_task_ids_list.append(true_task_ids_batch)
+
+    # 2. 収集したデータを集計
+    all_head_means = torch.cat(all_head_means_list, dim=0)
+    all_true_task_ids = torch.cat(all_true_task_ids_list, dim=0)
+    
+    # 3. 分析行列を作成
+    
+    # 行列1: 各ヘッドの平均logit値（バイアスの可視化）
+    # (行 = 入力画像の真のタスク, 列 = 出力ヘッド)
+    mean_value_matrix = torch.zeros(num_tasks, num_tasks)
+    
+    # 行列2: グループルーティングの混乱行列
+    # (行 = 入力画像の真のタスク, 列 = argmaxで選ばれたヘッド)
+    routing_confusion_matrix = torch.zeros(num_tasks, num_tasks)
+    
+    # どのヘッド（グループ）が勝ったか
+    pred_head_group = all_head_means.argmax(dim=1) # [全サンプル数]
+
+    for true_task in range(num_tasks):
+        # 真のタスクが t であるサンプルのインデックス
+        mask = (all_true_task_ids == true_task)
+        if mask.sum() == 0:
+            continue
+            
+        # 1. 真のタスク t の入力に対する、全ヘッドの平均logit値
+        mean_values_for_task_t = all_head_means[mask].mean(dim=0)
+        mean_value_matrix[true_task, :] = mean_values_for_task_t
+        
+        # 2. 真のタスク t の入力が、どのヘッドグループにルーティングされたか
+        preds_for_task_t = pred_head_group[mask]
+        for pred_task in range(num_tasks):
+            count = (preds_for_task_t == pred_task).sum().item()
+            routing_confusion_matrix[true_task, pred_task] = (count / mask.sum().item()) * 100.0
+
+    # 4. 結果の出力
+    print("分析1: 平均logit値の行列 (行=入力タスク / 列=出力ヘッド)")
+    print("       (対角成分が他よりも高ければ、バイアスが制御できていることを示唆)")
+    print(mean_value_matrix.numpy().round(3))
+    
+    print("\n分析2: グループルーティング混乱行列 (行=入力タスク / 列=予測ヘッド) [%]")
+    print("       (対角成分が高ければ、教授の仮説が正しいことを示す)")
+    print(routing_confusion_matrix.numpy().round(2))
+    print("--- 分析終了 ---")
+
 def test_class_incremental_nme(args, model, device, data, current_task_id, taskcla, proto_manager):
     """
     クラス増分学習のためのNME（最近傍平均）評価関数
@@ -141,8 +237,8 @@ def train(args, model, device, x, y, optimizer, criterion, task_id):
         data = x[b]
         data, target = data.to(device), y[b].to(device)
         optimizer.zero_grad()
-        output = model(data)
-        loss = criterion(output[task_id], target)
+        output_list, _ = model(data)
+        loss = criterion(output_list[task_id], target)
         loss.backward()
         optimizer.step()
 
@@ -171,7 +267,7 @@ def train_projected(
         data = x[b]
         data, target = data.to(device), y[b].to(device)
         optimizer.zero_grad()
-        output = model(data)
+        output,_ = model(data)
         loss = criterion(output[task_id], target)
         loss.backward()
         # Gradient Projections
@@ -238,9 +334,9 @@ def test(args, model, device, x, y, criterion, task_id, **kwargs):
                 b = r[i:]
             data = x[b]
             data, target = data.to(device), y[b].to(device)
-            output = model(data)
-            loss = criterion(output[task_id], target)
-            pred = output[task_id].argmax(dim=1, keepdim=True)
+            output_list, _ = model(data)
+            loss = criterion(output_list[task_id], target)
+            pred = output_list[task_id].argmax(dim=1, keepdim=True)
 
             correct += pred.eq(target.view_as(pred)).sum().item()
             total_loss += loss.item() * len(b)

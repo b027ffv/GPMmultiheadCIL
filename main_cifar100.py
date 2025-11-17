@@ -78,6 +78,7 @@ def main(args):
                 update_GPM,
                 test_class_incremental,
                 test_class_incremental_nme,
+                analyze_head_outputs,
             )
         else:
             raise ValueError("Invalid dataset")
@@ -226,6 +227,8 @@ def main(args):
                     importance_list,
                     Nullspace_alltask_list,
                 )
+            #print("EFC++: プロトタイプ計算中...")
+            #proto_manager.compute_prototypes(model, data, task_id)
 
         else:
             if args.method == "GPM":
@@ -396,8 +399,8 @@ def main(args):
                 )
             # --- 3. EFC++ プロトタイプ計算 ---
             # (GPM基底更新の後)
-            print("EFC++: プロトタイプ計算中...")
-            proto_manager.compute_prototypes(model, data, task_id)
+            #print("EFC++: プロトタイプ計算中...")
+            #proto_manager.compute_prototypes(model, data, task_id)
             
             """# --- 4. EFC++ リバランシング ---
             if task_id > 0:
@@ -414,8 +417,9 @@ def main(args):
         print("Compute Class Incremental Accuracy (Pseudo-Single Head)...")
         if args.method == "GPM" or args.method == "GPCNS" or args.method == "SGP":
             # gpm.py または該当するファイルに追加した関数を呼び出す
-            cil_acc = test_class_incremental_nme(args, model, device, data, task_id, taskcla,proto_manager)
+            cil_acc = test_class_incremental(args, model, device, data, task_id, taskcla)
             print(f"Task {task_id} - CIL Accuracy: {cil_acc:.2f}%")
+        analyze_head_outputs(args, model, device, data, task_id, taskcla)
         print("Accuracies =")
         for i in range(task_id + 1):
             print("\t", end="")

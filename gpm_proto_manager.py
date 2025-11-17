@@ -49,13 +49,14 @@ class ProtoManager:
                 # return y, x (または y, out)
                 # 
                 # 修正が難しい場合、暫定的に最後の層の活性化を取得する
-                output_list = model(x)
+                """output_list = model(x)
                 if isinstance(model, torch.nn.DataParallel):
                     act_key = list(model.module.act.keys())[-1]
                     features = model.module.act[act_key]
                 else:
                     act_key = list(model.act.keys())[-1]
-                    features = model.act[act_key]
+                    features = model.act[act_key]"""
+                output_list, features = model(x)
                     
             except Exception as e:
                 print(f"特徴量の取得に失敗しました: {e}")
