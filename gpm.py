@@ -184,6 +184,7 @@ def test_class_incremental(args, model, device, data, current_task_id, taskcla):
     model.eval()
     total_correct = 0
     total_num = 0
+    task_accuracies = []
     
     # クラス数のオフセット計算用リスト (例: [0, 10, 20, ...])
     offsets = [0]
@@ -193,6 +194,9 @@ def test_class_incremental(args, model, device, data, current_task_id, taskcla):
     # これまでに学習した全タスクのテストデータで評価
     with torch.no_grad():
         for t in range(current_task_id + 1):
+
+            task_correct = 0
+            task_num = 0
             # タスク t のテストデータを取得
             x = data[t]['test']['x'].to(device)
             y = data[t]['test']['y'].to(device)
@@ -208,20 +212,58 @@ def test_class_incremental(args, model, device, data, current_task_id, taskcla):
                 target_batch = y_global[b]
                 
                 # モデルの出力を取得（全タスクのリスト）
-                output_list = model(data_batch)
-                
+                output_list, _ = model(data_batch)
+                """
                 # 現在のタスクまでのヘッドのみを結合 (Pseudo-Single Head化)
                 # output_list[:current_task_id+1] を結合 dim=1
-                output_global = torch.cat(output_list[:current_task_id+1], dim=1)
+                output_global = torch.cat(output_list[:current_task_id+1], dim=1)"""
+
+                # 現在のタスクまでのヘッドのみを対象
+                output_list_current = output_list[:current_task_id+1]
+                
+                # --- ▼▼▼ バイアス補正の工夫（L2ノルム正規化） ▼▼▼ ---
+                
+                normalized_outputs = []
+                for head_output in output_list_current:
+                    # head_output の形状: (バッチサイズ, タスク内クラス数)
+                    
+                    # 1. 各サンプル(バッチ内)のlogitベクトルのL2ノルム（長さ）を計算
+                    #    (dim=1 はクラス方向のノルム)
+                    #    (1e-6 はゼロ除算防止のための微小値)
+                    norm = torch.norm(head_output, p=2, dim=1, keepdim=True) + 1e-6
+                    
+                    # 2. logitベクトルをその長さで割り、ノルムを1に正規化
+                    normalized_outputs.append(head_output / norm)
+                
+                # 3. 正規化されたlogitを結合
+                output_global = torch.cat(normalized_outputs, dim=1)
+
+                # --- ▲▲▲ 工夫ここまで ▲▲▲ ---
                 
                 # 全クラスの中で最大値を持つインデックスを取得
                 pred = output_global.argmax(dim=1, keepdim=True)
                 
-                total_correct += pred.eq(target_batch.view_as(pred)).sum().item()
+                # 正解数を計算
+                correct_mask = pred.eq(target_batch.view_as(pred))
+                
+                # ★修正: タスクごとと全体の両方で集計
+                task_correct += correct_mask.sum().item()
+                total_correct += correct_mask.sum().item()
+                task_num += len(b)
                 total_num += len(b)
+            # ★追加: タスクtのバッチ処理が終わったら、タスクtの精度を計算
+            if task_num > 0:
+                task_acc = 100.0 * task_correct / task_num
+                task_accuracies.append(round(task_acc, 2)) # 小数点以下2桁でリストに追加
+            else:
+                task_accuracies.append(0.0) # データがなかった場合
 
-    acc = 100.0 * total_correct / total_num
-    return acc
+    # 全体の平均精度を計算
+    if total_num > 0:
+        acc = 100.0 * total_correct / total_num
+    else:
+        acc = 0.0
+    return acc, task_accuracies
 
 def train(args, model, device, x, y, optimizer, criterion, task_id):
     model.train()

@@ -35,6 +35,8 @@ def main(args):
         data, taskcla, inputsize = cf100.get_10split(seed=args.seed, pc_valid=args.pc_valid)
         task_list = list(range(10))
         acc_matrix = np.zeros((10, 10))
+        # ★追加: CIL用行列 (行: 学習完了タスクID, 列: 評価対象タスクID)
+        cil_acc_matrix = np.zeros((10, 10))
     elif args.dataset == "cifar100-20":
         from dataloader import cifar100 as cf100
 
@@ -68,6 +70,7 @@ def main(args):
                 update_GPM,
                 test_class_incremental,
                 test_class_incremental_nme,
+                analyze_head_outputs,
             )
         elif args.dataset == "miniimagenet":
             from gpm import (
@@ -416,9 +419,21 @@ def main(args):
             jj += 1
         print("Compute Class Incremental Accuracy (Pseudo-Single Head)...")
         if args.method == "GPM" or args.method == "GPCNS" or args.method == "SGP":
-            # gpm.py または該当するファイルに追加した関数を呼び出す
-            cil_acc = test_class_incremental(args, model, device, data, task_id, taskcla)
-            print(f"Task {task_id} - CIL Accuracy: {cil_acc:.2f}%")
+            # ★修正: 戻り値をタプルで受け取る
+            cil_acc, task_accs = test_class_incremental(args, model, device, data, task_id, taskcla)
+            # task_accs は [Task0の精度, Task1の精度, ..., CurrentTaskの精度] のリスト
+            # これを cil_acc_matrix の現在の行 (task_id) に格納
+            for i, acc in enumerate(task_accs):
+                cil_acc_matrix[task_id, i] = acc
+            
+            # ★修正: 平均精度とタスクごと精度の両方を出力
+            print(f"Task {task_id} - CIL Average Accuracy: {cil_acc:.2f}%")
+            
+            # ★追加: タスクごと精度の詳細を出力
+            # (例: [T0: 90.10%, T1: 45.20%, T2: 30.00%])
+            task_accs_str = [f"T{i}: {acc:.2f}%" for i, acc in enumerate(task_accs)]
+            print(f"  -> Task-wise CIL Accs: [{', '.join(task_accs_str)}]")
+            print(cil_acc_matrix)
         analyze_head_outputs(args, model, device, data, task_id, taskcla)
         print("Accuracies =")
         for i in range(task_id + 1):
