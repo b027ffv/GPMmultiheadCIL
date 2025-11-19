@@ -4,6 +4,342 @@ import torch.nn.functional as F
 
 from model import compute_conv_output_size
 
+
+def test_class_incremental_subspace(args, model, device, data, current_task_id, taskcla, task_basis_memory, score_prototypes=None, return_stats=False, skip_layers=3):
+    """
+    部分空間法：スコア空間でのNME
+    - return_stats=True: 現在のタスクのデータから「平均スコアベクトル」を計算して返す（学習直後に使用）
+    - score_prototypes: 学習済みの平均スコアベクトル辞書（推論時に使用）
+    """
+    model.eval()
+    num_tasks = current_task_id + 1
+    
+    # 統計収集モードの場合、対象は現在のタスクのみ
+    if return_stats:
+        target_tasks = [current_task_id]
+    else:
+        # 推論モードなら全タスク
+        target_tasks = range(current_task_id + 1)
+        total_correct = 0
+        total_num = 0
+        task_accuracies = []
+
+    offsets = [0]
+    for i in range(len(taskcla)-1):
+        offsets.append(offsets[-1] + taskcla[i][1])
+
+    # 基底の準備
+    gpu_bases = {}
+    for t, bases in task_basis_memory.items():
+        gpu_bases[t] = []
+        for base in bases:
+            if base is not None:
+                gpu_bases[t].append(torch.from_numpy(base).float().to(device))
+            else:
+                gpu_bases[t].append(None)
+    
+    # スコアプロトタイプの準備 (推論時)
+    if score_prototypes is not None:
+        # 辞書からテンソル行列へ変換 [N_Tasks, N_Tasks] (パディング含む)
+        # 行k: Task k のプロトタイプベクトル (長さk+1, 以降は0)
+        max_dim = current_task_id + 1
+        prototypes_matrix = torch.zeros(max_dim, max_dim).to(device)
+        for t_id, proto in score_prototypes.items():
+            if t_id < max_dim:
+                length = len(proto)
+                prototypes_matrix[t_id, :length] = proto.to(device)
+
+    # 統計収集用
+    collected_scores = []
+
+    with torch.no_grad():
+        for t in target_tasks: # 統計収集時は1ループのみ
+            
+            if not return_stats:
+                task_correct = 0
+                task_num = 0
+            
+            # データローダー (統計収集時は学習データを使う)
+            if return_stats:
+                x_data = data[t]['train']['x']
+                y_data = data[t]['train']['y']
+            else:
+                x_data = data[t]['test']['x']
+                y_data = data[t]['test']['y']
+            
+            x_data = x_data.to(device)
+            y_data = y_data.to(device)
+            y_global = y_data + offsets[t]
+            
+            r = np.arange(x_data.size(0))
+            for i in range(0, len(r), args.batch_size_test):
+                b = r[i : i + args.batch_size_test]
+                data_batch = x_data[b]
+                target_batch = y_global[b]
+
+                # 1. 特徴量取得
+                _ = model(data_batch)
+                activations = []
+                if hasattr(model, 'act'):
+                    layer_keys = list(model.act.keys())
+                    for key in layer_keys:
+                        val = model.act[key]
+                        if len(val.shape) > 2:
+                            val = val.view(val.size(0), -1).T
+                        else:
+                            val = val.view(val.size(0), -1).T
+                        activations.append(val)
+
+                # 2. スコアベクトルの計算 [N_Available_Tasks, Batch]
+                # 統計収集時は current_task_id (自分) までの基底を使う
+                # 推論時も current_task_id (全) までの基底を使う
+                num_bases_to_use = current_task_id + 1
+                bsz = data_batch.size(0)
+                scores_tensor = torch.zeros(num_bases_to_use, bsz).to(device)
+                
+                for task_idx in range(num_bases_to_use):
+                    bases_list = gpu_bases.get(task_idx, [])
+                    for layer_idx, base in enumerate(bases_list):
+                        if layer_idx < skip_layers: continue
+                        if base is None: continue
+                        if layer_idx >= len(activations): break
+                        
+                        act = activations[layer_idx]
+                        if act.size(0) != base.size(0): continue
+
+                        total_layer_energy = torch.sum(act ** 2, dim=0) + 1e-8
+                        proj = torch.mm(base.T, act)
+                        subspace_energy = torch.sum(proj ** 2, dim=0)
+                        
+                        ratio = subspace_energy / total_layer_energy
+                        scores_tensor[task_idx] += ratio
+                
+                # --- 分岐 ---
+                
+                if return_stats:
+                    # 統計収集モード: スコアを蓄積
+                    # [N_Tasks, Batch] -> [Batch, N_Tasks]
+                    collected_scores.append(scores_tensor.T)
+                    
+                else:
+                    # 推論モード: NMEでタスク選択
+                    # scores_tensor: [N_Tasks, Batch] -> 入力サンプルのスコアベクトル
+                    
+                    # プロトタイプとの距離を計算
+                    # Sample: [Batch, 1, N_Tasks]
+                    # Proto:  [1, N_Tasks, N_Tasks]
+                    
+                    sample_vec = scores_tensor.T.unsqueeze(1) # [B, 1, N]
+                    proto_vec = prototypes_matrix.unsqueeze(0) # [1, N, N]
+                    
+                    # ユークリッド距離 ||s - p||^2
+                    dists = torch.sum((sample_vec - proto_vec) ** 2, dim=2) # [B, N]
+                    
+                    best_task_indices = torch.argmin(dists, dim=1) # 距離最小のタスク
+                    
+                    # 最終予測
+                    output_list, _ = model(data_batch)
+                    task_preds = []
+                    for task_idx in range(num_tasks):
+                        pred_local = torch.argmax(output_list[task_idx], dim=1)
+                        task_preds.append(pred_local + offsets[task_idx])
+                    task_preds = torch.stack(task_preds, dim=1)
+                    
+                    final_preds = task_preds.gather(1, best_task_indices.unsqueeze(1)).squeeze(1)
+                    
+                    batch_correct = final_preds.eq(target_batch).sum().item()
+                    task_correct += batch_correct
+                    total_correct += batch_correct
+                    task_num += len(b)
+                    total_num += len(b)
+            
+            if not return_stats:
+                if task_num > 0:
+                    task_accuracies.append(round(100.0 * task_correct / task_num, 2))
+                else:
+                    task_accuracies.append(0.0)
+    
+    if return_stats:
+        # 平均スコアベクトルを返す
+        all_scores = torch.cat(collected_scores, dim=0) # [TotalTrainData, N_Tasks]
+        mean_scores = all_scores.mean(dim=0) # [N_Tasks]
+        return mean_scores
+    else:
+        acc = 100.0 * total_correct / total_num
+        
+        # 行列表示 (task_selection_matrixの実装は省略しましたが、必要なら戻します)
+        print(f"Task {current_task_id} - CIL Average Accuracy: {acc:.2f}%")
+        print(f"  -> Task-wise CIL Accs: {task_accuracies}")
+        
+        return acc, task_accuracies
+
+def test_class_incremental_energy(args, model, device, data, current_task_id, taskcla, proto_manager, gamma=0.0):
+    """
+    エネルギーのZ-score正規化によるタスク選択
+    """
+    model.eval()
+    total_correct = 0
+    total_num = 0
+    task_accuracies = []
+    
+    # タスク選択混同行列
+    num_tasks = current_task_id + 1
+    task_selection_matrix = torch.zeros(num_tasks, num_tasks).to(device)
+    
+    offsets = [0]
+    for i in range(len(taskcla)-1):
+        offsets.append(offsets[-1] + taskcla[i][1])
+        
+    # エネルギー統計量を取得
+    energy_stats = proto_manager.task_energy_stats
+
+    with torch.no_grad():
+        for t in range(num_tasks):
+            task_correct = 0
+            task_num = 0
+            
+            x = data[t]['test']['x'].to(device)
+            y = data[t]['test']['y'].to(device)
+            y_global = y + offsets[t]
+            
+            r = np.arange(x.size(0))
+            for i in range(0, len(r), args.batch_size_test):
+                b = r[i : i + args.batch_size_test]
+                data_batch = x[b]
+                target_batch = y_global[b]
+                
+                output_list, _ = model(data_batch)
+                
+                task_scores = []
+                task_preds = []
+                
+                for task_idx in range(num_tasks):
+                    logits = output_list[task_idx]
+                    lse = torch.logsumexp(logits, dim=1) # [Batch]
+                    
+                    # ★Z-score正規化
+                    mean_e, std_e = energy_stats.get(task_idx, (0.0, 1.0))
+                    
+                    # (x - mean) / std
+                    # stdが大きい(スコアが暴れやすい)タスクは、分母が大きくなるのでスコアが抑制される
+                    z_score = (lse - mean_e) / std_e
+                    
+                    # バイアス補正 (まずは0.0推奨)
+                    # 正規化されているので、gamma=0.1等の効果が以前より明確になります
+                    score = z_score + (gamma * task_idx)
+                    
+                    task_scores.append(score)
+                    
+                    pred_local = torch.argmax(logits, dim=1)
+                    task_preds.append(pred_local + offsets[task_idx])
+
+                task_scores = torch.stack(task_scores, dim=1)
+                task_preds = torch.stack(task_preds, dim=1)
+                
+                best_task_indices = torch.argmax(task_scores, dim=1)
+                
+                for pred_t in best_task_indices:
+                    task_selection_matrix[t, pred_t] += 1
+                
+                final_preds = task_preds.gather(1, best_task_indices.unsqueeze(1)).squeeze(1)
+                
+                batch_correct = final_preds.eq(target_batch).sum().item()
+                task_correct += batch_correct
+                total_correct += batch_correct
+                task_num += len(b)
+                total_num += len(b)
+            
+            if task_num > 0:
+                task_accuracies.append(round(100.0 * task_correct / task_num, 2))
+            else:
+                task_accuracies.append(0.0)
+
+    acc = 100.0 * total_correct / total_num
+    
+    print(f"\n--- Task Selection Analysis (Z-score Energy, Gamma={gamma}) ---")
+    row_sums = task_selection_matrix.sum(dim=1, keepdim=True)
+    row_sums[row_sums == 0] = 1.0
+    print(((task_selection_matrix / row_sums) * 100.0).cpu().numpy().round(1))
+    print("-------------------------------------------------------------\n")
+
+    return acc, task_accuracies
+
+def test_class_incremental_entropy(args, model, device, data, current_task_id, taskcla):
+    """
+    エントロピー最小化によるタスク選択を行うClass-IL評価
+    (Task-ILの精度が高い場合に特に有効)
+    """
+    model.eval()
+    total_correct = 0
+    total_num = 0
+    task_accuracies = []
+    
+    # オフセット計算
+    offsets = [0]
+    for i in range(len(taskcla)-1):
+        offsets.append(offsets[-1] + taskcla[i][1])
+
+    with torch.no_grad():
+        for t in range(current_task_id + 1):
+            task_correct = 0
+            task_num = 0
+            
+            x = data[t]['test']['x'].to(device)
+            y = data[t]['test']['y'].to(device)
+            y_global = y + offsets[t]
+            
+            r = np.arange(x.size(0))
+            for i in range(0, len(r), args.batch_size_test):
+                b = r[i : i + args.batch_size_test]
+                data_batch = x[b]
+                target_batch = y_global[b]
+                
+                # ロジットを取得 (featuresは不要)
+                output_list, _ = model(data_batch)
+                
+                # 各タスクのヘッドのエントロピーを計算
+                entropies = []
+                preds = []
+                
+                for task_idx in range(current_task_id + 1):
+                    logits = output_list[task_idx] # [Batch, N_classes_in_task]
+                    probs = torch.softmax(logits, dim=1)
+                    
+                    # エントロピー計算: -sum(p * log(p))
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1) # [Batch]
+                    entropies.append(entropy)
+                    
+                    # そのヘッド内での予測クラス
+                    pred_local = torch.argmax(logits, dim=1)
+                    pred_global = pred_local + offsets[task_idx]
+                    preds.append(pred_global)
+                
+                # [Batch, N_tasks]
+                entropies = torch.stack(entropies, dim=1)
+                preds = torch.stack(preds, dim=1)
+                
+                # エントロピーが最小のタスクを選択
+                # (最も自信があるヘッドを選ぶ)
+                best_task_indices = torch.argmin(entropies, dim=1) # [Batch]
+                
+                # 選択されたタスクの予測を採用
+                # preds: [Batch, Tasks] -> gatherで取得
+                final_preds = preds.gather(1, best_task_indices.unsqueeze(1)).squeeze(1)
+                
+                batch_correct = final_preds.eq(target_batch).sum().item()
+                task_correct += batch_correct
+                total_correct += batch_correct
+                task_num += len(b)
+                total_num += len(b)
+            
+            if task_num > 0:
+                task_accuracies.append(round(100.0 * task_correct / task_num, 2))
+            else:
+                task_accuracies.append(0.0)
+
+    acc = 100.0 * total_correct / total_num
+    return acc, task_accuracies
+
 def analyze_head_outputs(args, model, device, data, current_task_id, taskcla):
     """
     教授の仮説を検証するための分析関数。
@@ -101,80 +437,81 @@ def analyze_head_outputs(args, model, device, data, current_task_id, taskcla):
     print("--- 分析終了 ---")
 
 def test_class_incremental_nme(args, model, device, data, current_task_id, taskcla, proto_manager):
-    """
-    クラス増分学習のためのNME（最近傍平均）評価関数
-    (分類ヘッド fc3 を使わず、プロトタイプとの距離で分類する)
-    戻り値: (全体の平均精度, タスクごとの精度リスト)
-    """
     model.eval()
     total_correct = 0
     total_num = 0
-    task_accuracies = [] # ★追加: タスクごとの精度保存用リスト
+    task_accuracies = []
 
-    # 1. 全既知クラスのプロトタイプを取得
     if not proto_manager.prototypes:
-        print("エラー: プロトタイプが計算されていません。")
-        return 0.0, [] # ★修正: 戻り値の形式を合わせる
+        return 0.0, []
 
-    # 辞書のキー（グローバルクラスID）と値（プロトタイプ）を抽出し、順序を固定
     known_class_ids = list(proto_manager.prototypes.keys())
-    all_prototypes = torch.stack(list(proto_manager.prototypes.values())).to(device)
+    all_prototypes = torch.stack([proto_manager.prototypes[k] for k in known_class_ids]).to(device)
+    
+    # ★追加: 各プロトタイプがどのタスクに属するかを特定するためのマップ
+    # (簡易的にオフセットから逆算)
+    proto_task_ids = []
+    offsets = proto_manager.offsets
+    for k in known_class_ids:
+        for t_idx in range(len(offsets)-1):
+            if offsets[t_idx] <= k < offsets[t_idx+1]:
+                proto_task_ids.append(t_idx)
+                break
+        else: # 最後のタスク
+            proto_task_ids.append(len(offsets)-1)
+    proto_task_ids = torch.tensor(proto_task_ids).to(device)
 
     with torch.no_grad():
         for t in range(current_task_id + 1):
-            # ★追加: タスクごとの集計変数を初期化
             task_correct = 0
             task_num = 0
-
-            # タスク t のテストデータを取得
             x = data[t]['test']['x'].to(device)
             y = data[t]['test']['y'].to(device)
-            
-            # グローバルラベルに変換
-            y_global = y + proto_manager.offsets[t]
-            
-            # バッチごとに処理
+            y_global = y + offsets[t]
             r = np.arange(x.size(0))
+
             for i in range(0, len(r), args.batch_size_test):
                 b = r[i : i + args.batch_size_test]
                 data_batch = x[b]
                 target_batch = y_global[b]
                 
-                # 2. モデルで特徴量を抽出
                 try:
                     _, features_batch = model(data_batch)
-                except ValueError:
-                    _ = model(data_batch)
-                    if isinstance(model, torch.nn.DataParallel):
-                        act_key = list(model.module.act.keys())[-1]
-                        features_batch = model.module.act[act_key]
-                    else:
-                        act_key = list(model.act.keys())[-1]
-                        features_batch = model.act[act_key]
+                except:
+                    _, features_batch = model(data_batch)
 
-                # 3. 特徴量と全プロトタイプとの距離を計算
-                dist = torch.cdist(features_batch.unsqueeze(1), all_prototypes.unsqueeze(0))
-                dist = dist.squeeze(1)
+                # L2正規化
+                features_batch = F.normalize(features_batch, p=2, dim=1)
+
+                # 距離計算 (Batch, Class)
+                # dist = ||f - p||^2 = 2 - 2(f.p)  (正規化されているので)
+                # コサイン類似度を使う方が計算が速く、バイアスもかけやすい
+                # sim = (Batch, Dim) @ (Class, Dim).T -> (Batch, Class)
+                sim = torch.mm(features_batch, all_prototypes.T)
                 
-                # 4. 最も距離が近いプロトタイプの「インデックス」を取得
+                # 距離に変換 (距離が小さいほど良い)
+                dist = 2 - 2 * sim
+                
+                # --- ★距離バイアス補正 (Experimental) ---
+                # 古いタスクほど距離を少し減らす（＝類似度を上げる）
+                # バイアス項: Task Tのデータに対して、距離 - gamma * (CurrentTask - TaskID)
+                # gamma = 0.1 程度で調整
+                gamma = 0.01
+                bias = gamma * (current_task_id - proto_task_ids)
+                dist = dist - bias.unsqueeze(0) # ブロードキャスト
+                # ----------------------------------------
+
                 pred_indices = torch.argmin(dist, dim=1)
-                
-                # 5. インデックスをグローバルクラスIDに変換
                 pred_global_ids = torch.tensor([known_class_ids[idx] for idx in pred_indices]).to(device)
 
-                # ★修正: タスクごとと全体の両方で集計
                 batch_correct = pred_global_ids.eq(target_batch).sum().item()
                 task_correct += batch_correct
                 total_correct += batch_correct
-                
-                batch_len = len(b)
-                task_num += batch_len
-                total_num += batch_len
+                task_num += len(b)
+                total_num += len(b)
 
-            # ★追加: タスクtのループ終了時に、そのタスクの精度を計算
             if task_num > 0:
-                task_acc = 100.0 * task_correct / task_num
-                task_accuracies.append(round(task_acc, 2))
+                task_accuracies.append(round(100.0 * task_correct / task_num, 2))
             else:
                 task_accuracies.append(0.0)
 
@@ -546,7 +883,7 @@ def get_representation_matrix_ResNet18(net, device, x, y=None):
     return mat_final
 
 
-def update_GPM(
+"""def update_GPM(
     model,
     mat_list,
     threshold,
@@ -603,4 +940,65 @@ def update_GPM(
     #         )
     #     )
     # print("-" * 40)
-    return feature_list
+    return feature_list"""
+def update_GPM(model, mat_list, threshold, feature_list=[], return_new_only=False):
+    """
+    return_new_only=True の場合、今回のタスクで新規獲得した基底(U_new)のリストも返す
+    """
+    new_feature_list = [] # 今回のタスク専用の基底リスト
+
+    if not feature_list:
+        # After First Task
+        for i in range(len(mat_list)):
+            activation = mat_list[i]
+            U, S, Vh = np.linalg.svd(activation, full_matrices=False)
+            sval_total = (S**2).sum()
+            sval_ratio = (S**2) / sval_total
+            r = np.sum(np.cumsum(sval_ratio) < threshold[i])
+            
+            # 基底を登録
+            U_new = U[:, 0:r]
+            feature_list.append(U_new)
+            new_feature_list.append(U_new) # 新規分として保存
+    else:
+        for i in range(len(mat_list)):
+            activation = mat_list[i]
+            U1, S1, Vh1 = np.linalg.svd(activation, full_matrices=False)
+            sval_total = (S1**2).sum()
+            
+            # 既存の基底成分を除去 (射影)
+            act_hat = activation - np.dot(np.dot(feature_list[i], feature_list[i].transpose()), activation)
+            U, S, Vh = np.linalg.svd(act_hat, full_matrices=False)
+            
+            sval_hat = (S**2).sum()
+            sval_ratio = (S**2) / sval_total
+            accumulated_sval = (sval_total - sval_hat) / sval_total
+
+            r = 0
+            for ii in range(sval_ratio.shape[0]):
+                if accumulated_sval < threshold[i]:
+                    accumulated_sval += sval_ratio[ii]
+                    r += 1
+                else:
+                    break
+            
+            if r == 0:
+                print("Skip Updating GPM for layer: {}".format(i + 1))
+                new_feature_list.append(None) # 新規基底なし
+                continue
+            
+            # 新規基底
+            U_new = U[:, 0:r]
+            new_feature_list.append(U_new)
+
+            # GPM全体の基底を更新 (既存 + 新規)
+            Ui = np.hstack((feature_list[i], U_new))
+            if Ui.shape[1] > Ui.shape[0]:
+                feature_list[i] = Ui[:, 0 : Ui.shape[0]]
+            else:
+                feature_list[i] = Ui
+
+    if return_new_only:
+        return feature_list, new_feature_list
+    else:
+        return feature_list

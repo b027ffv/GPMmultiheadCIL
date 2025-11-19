@@ -59,6 +59,8 @@ def main(args):
 
     # EFC++: プロトタイプマネージャーを初期化
     proto_manager = ProtoManager(device, taskcla, args.batch_size_test)
+    task_basis_memory = {} # ★追加: タスクごとの基底を保存
+    score_prototypes = {} # ★追加: スコアのプロトタイプを保存
 
     if args.method == "GPM":
         if args.dataset == "cifar100-10" or args.dataset == "cifar100-20":
@@ -71,6 +73,9 @@ def main(args):
                 test_class_incremental,
                 test_class_incremental_nme,
                 analyze_head_outputs,
+                test_class_incremental_entropy,
+                test_class_incremental_energy,
+                test_class_incremental_subspace,
             )
         elif args.dataset == "miniimagenet":
             from gpm import (
@@ -82,6 +87,9 @@ def main(args):
                 test_class_incremental,
                 test_class_incremental_nme,
                 analyze_head_outputs,
+                test_class_incremental_entropy,
+                test_class_incremental_energy,
+                test_class_incremental_subspace,
             )
         else:
             raise ValueError("Invalid dataset")
@@ -191,7 +199,19 @@ def main(args):
                 elif args.dataset == "miniimagenet":
                     mat_list = get_representation_matrix_ResNet18(model, device, xtrain, ytrain)
 
-                feature_list = update_GPM(model, mat_list, threshold, feature_list)
+                # ★修正: return_new_only=True で新規基底も受け取る
+                feature_list, new_bases = update_GPM(model, mat_list, threshold, feature_list, return_new_only=True)
+                # 保存
+                task_basis_memory[task_id] = new_bases
+                # ★追加: スコアプロトタイプの計算
+                print("Computing Subspace Score Prototype...")
+                # return_stats=True で呼び出し。現在のタスク(task_id)のデータに対する反応を見る
+                proto_vec = test_class_incremental_subspace(
+                    args, model, device, data, task_id, taskcla, 
+                    task_basis_memory, return_stats=True, skip_layers=3
+                )
+                score_prototypes[task_id] = proto_vec
+                print(f"  -> Prototype for Task {task_id}: {proto_vec.cpu().numpy()}")
 
             elif args.method == "SGP":
                 if args.dataset == "cifar100-10" or args.dataset == "cifar100-20":
@@ -230,8 +250,8 @@ def main(args):
                     importance_list,
                     Nullspace_alltask_list,
                 )
-            #print("EFC++: プロトタイプ計算中...")
-            #proto_manager.compute_prototypes(model, data, task_id)
+            print("EFC++: プロトタイプ計算中...")
+            proto_manager.compute_prototypes(model, data, task_id)
 
         else:
             if args.method == "GPM":
@@ -361,7 +381,18 @@ def main(args):
                 elif args.dataset == "miniimagenet":
                     mat_list = get_representation_matrix_ResNet18(model, device, xtrain, ytrain)
 
-                feature_list = update_GPM(model, mat_list, threshold, feature_list)
+                feature_list, new_bases = update_GPM(model, mat_list, threshold, feature_list, return_new_only=True)
+                # ★保存
+                task_basis_memory[task_id] = new_bases
+                # ★追加: スコアプロトタイプの計算
+                print("Computing Subspace Score Prototype...")
+                # return_stats=True で呼び出し。現在のタスク(task_id)のデータに対する反応を見る
+                proto_vec = test_class_incremental_subspace(
+                    args, model, device, data, task_id, taskcla, 
+                    task_basis_memory, return_stats=True, skip_layers=3
+                )
+                score_prototypes[task_id] = proto_vec
+                print(f"  -> Prototype for Task {task_id}: {proto_vec.cpu().numpy()}")
 
             elif args.method == "SGP":
                 if args.dataset == "cifar100-10" or args.dataset == "cifar100-20":
@@ -402,8 +433,8 @@ def main(args):
                 )
             # --- 3. EFC++ プロトタイプ計算 ---
             # (GPM基底更新の後)
-            #print("EFC++: プロトタイプ計算中...")
-            #proto_manager.compute_prototypes(model, data, task_id)
+            print("EFC++: プロトタイプ計算中...")
+            proto_manager.compute_prototypes(model, data, task_id)
             
             """# --- 4. EFC++ リバランシング ---
             if task_id > 0:
@@ -420,7 +451,7 @@ def main(args):
         print("Compute Class Incremental Accuracy (Pseudo-Single Head)...")
         if args.method == "GPM" or args.method == "GPCNS" or args.method == "SGP":
             # ★修正: 戻り値をタプルで受け取る
-            cil_acc, task_accs = test_class_incremental(args, model, device, data, task_id, taskcla)
+            cil_acc, task_accs = test_class_incremental_subspace(args, model, device, data, task_id, taskcla, task_basis_memory, score_prototypes=score_prototypes, skip_layers=3)
             # task_accs は [Task0の精度, Task1の精度, ..., CurrentTaskの精度] のリスト
             # これを cil_acc_matrix の現在の行 (task_id) に格納
             for i, acc in enumerate(task_accs):
