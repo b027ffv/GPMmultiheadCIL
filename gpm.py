@@ -104,25 +104,28 @@ def test_class_incremental_nme(args, model, device, data, current_task_id, taskc
     """
     クラス増分学習のためのNME（最近傍平均）評価関数
     (分類ヘッド fc3 を使わず、プロトタイプとの距離で分類する)
+    戻り値: (全体の平均精度, タスクごとの精度リスト)
     """
     model.eval()
     total_correct = 0
     total_num = 0
+    task_accuracies = [] # ★追加: タスクごとの精度保存用リスト
 
     # 1. 全既知クラスのプロトタイプを取得
-    # proto_manager.prototypes は { global_class_id: テンソル } の辞書
     if not proto_manager.prototypes:
         print("エラー: プロトタイプが計算されていません。")
-        return 0.0
+        return 0.0, [] # ★修正: 戻り値の形式を合わせる
 
     # 辞書のキー（グローバルクラスID）と値（プロトタイプ）を抽出し、順序を固定
-    # .items() は Python 3.7+ で挿入順を保証
     known_class_ids = list(proto_manager.prototypes.keys())
     all_prototypes = torch.stack(list(proto_manager.prototypes.values())).to(device)
-    # all_prototypes の形状: [全クラス数, 特徴量次元数]
 
     with torch.no_grad():
         for t in range(current_task_id + 1):
+            # ★追加: タスクごとの集計変数を初期化
+            task_correct = 0
+            task_num = 0
+
             # タスク t のテストデータを取得
             x = data[t]['test']['x'].to(device)
             y = data[t]['test']['y'].to(device)
@@ -137,18 +140,10 @@ def test_class_incremental_nme(args, model, device, data, current_task_id, taskc
                 data_batch = x[b]
                 target_batch = y_global[b]
                 
-                # 2. モデルで特徴量を抽出 (分類ヘッドは使わない)
-                # (model.py の forward が (output_list, features) を返すよう要修正)
-                
-                # --- GPMモデル(model.py)の修正が前提 ---
-                # AlexNet/ResNet18 の forward の最後を以下のように変更
-                # return y, x  (AlexNet)
-                # return y, out (ResNet18)
-                
+                # 2. モデルで特徴量を抽出
                 try:
                     _, features_batch = model(data_batch)
                 except ValueError:
-                    # GPMモデル(model.py)の修正がされていない場合のフォールバック
                     _ = model(data_batch)
                     if isinstance(model, torch.nn.DataParallel):
                         act_key = list(model.module.act.keys())[-1]
@@ -158,11 +153,8 @@ def test_class_incremental_nme(args, model, device, data, current_task_id, taskc
                         features_batch = model.act[act_key]
 
                 # 3. 特徴量と全プロトタイプとの距離を計算
-                # (バッチサイズ, 1, 特徴量次元) と (1, 全クラス数, 特徴量次元) でユークリッド距離を計算
                 dist = torch.cdist(features_batch.unsqueeze(1), all_prototypes.unsqueeze(0))
-                # dist の形状: (バッチサイズ, 1, 全クラス数)
-                
-                dist = dist.squeeze(1) # 形状: (バッチサイズ, 全クラス数)
+                dist = dist.squeeze(1)
                 
                 # 4. 最も距離が近いプロトタイプの「インデックス」を取得
                 pred_indices = torch.argmin(dist, dim=1)
@@ -170,11 +162,24 @@ def test_class_incremental_nme(args, model, device, data, current_task_id, taskc
                 # 5. インデックスをグローバルクラスIDに変換
                 pred_global_ids = torch.tensor([known_class_ids[idx] for idx in pred_indices]).to(device)
 
-                total_correct += pred_global_ids.eq(target_batch).sum().item()
-                total_num += len(b)
+                # ★修正: タスクごとと全体の両方で集計
+                batch_correct = pred_global_ids.eq(target_batch).sum().item()
+                task_correct += batch_correct
+                total_correct += batch_correct
+                
+                batch_len = len(b)
+                task_num += batch_len
+                total_num += batch_len
+
+            # ★追加: タスクtのループ終了時に、そのタスクの精度を計算
+            if task_num > 0:
+                task_acc = 100.0 * task_correct / task_num
+                task_accuracies.append(round(task_acc, 2))
+            else:
+                task_accuracies.append(0.0)
 
     acc = 100.0 * total_correct / total_num
-    return acc
+    return acc, task_accuracies
 
 
 def test_class_incremental(args, model, device, data, current_task_id, taskcla):
@@ -213,12 +218,12 @@ def test_class_incremental(args, model, device, data, current_task_id, taskcla):
                 
                 # モデルの出力を取得（全タスクのリスト）
                 output_list, _ = model(data_batch)
-                """
+                
                 # 現在のタスクまでのヘッドのみを結合 (Pseudo-Single Head化)
                 # output_list[:current_task_id+1] を結合 dim=1
-                output_global = torch.cat(output_list[:current_task_id+1], dim=1)"""
+                output_global = torch.cat(output_list[:current_task_id+1], dim=1)
 
-                # 現在のタスクまでのヘッドのみを対象
+                """# 現在のタスクまでのヘッドのみを対象
                 output_list_current = output_list[:current_task_id+1]
                 
                 # --- ▼▼▼ バイアス補正の工夫（L2ノルム正規化） ▼▼▼ ---
@@ -238,7 +243,7 @@ def test_class_incremental(args, model, device, data, current_task_id, taskcla):
                 # 3. 正規化されたlogitを結合
                 output_global = torch.cat(normalized_outputs, dim=1)
 
-                # --- ▲▲▲ 工夫ここまで ▲▲▲ ---
+                # --- ▲▲▲ 工夫ここまで ▲▲▲ ---"""
                 
                 # 全クラスの中で最大値を持つインデックスを取得
                 pred = output_global.argmax(dim=1, keepdim=True)
