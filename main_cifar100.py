@@ -11,6 +11,7 @@ from train_util import get_model, train_model, get_results
 # EFC++ 用のインポート
 from gpm_proto_manager import ProtoManager
 from gpm_balance_head import balance_classifier
+from task_selector import TaskSelector, train_task_selector, evaluate_with_selector, update_proto_statistics
 
 def main(args):
     random.seed(args.seed)
@@ -159,8 +160,15 @@ def main(args):
         if task_id == 0:
             if args.dataset == "cifar100-10" or args.dataset == "cifar100-20":
                 model = AlexNet(taskcla).to(device)
+                feat_dim = 2048 # AlexNetの最終層入力
             elif args.dataset == "miniimagenet":
                 model = ResNet18(taskcla, 20).to(device)
+                feat_dim = 160 * 3 * 3 # ResNet18の最終層入力 (AvgPool前のサイズに依存)
+                # 注意: model.pyのResNet forwardを確認すると、avg_pool2d(out, 2)後にviewしている
+                # 84x84 -> ... -> Layer4(6x6) -> AvgPool2d(2) -> 3x3. Channel=160. => 1440
+                feat_dim = 1440
+            # ★追加: タスク選択ネットワークの初期化
+            task_selector = TaskSelector(input_dim=feat_dim, max_tasks=len(taskcla)).to(device)
 
             feature_list = []
             importance_list = []  # SGP, GPCNS
@@ -252,6 +260,19 @@ def main(args):
                 )
             print("EFC++: プロトタイプ計算中...")
             proto_manager.compute_prototypes(model, data, task_id)
+            # ============================================================
+            # ★追加: ここからタスク選択ネットワークの学習フェーズ
+            # ============================================================
+            
+            # 1. ProtoManagerの統計情報(平均・共分散)を更新
+            # (gpm_proto_managerのcompute_prototypesが不完全な可能性が高いため、こちらの関数を使用)
+            print("Updating Proto Statistics for Generative Replay...")
+            update_proto_statistics(args, model, proto_manager, data, task_id)
+            
+            # 2. Task Selector の学習 (Current Data + Generated Old Data)
+            train_task_selector(args, model, task_selector, proto_manager, data, task_id, epochs=20)
+            
+            # ============================================================
 
         else:
             if args.method == "GPM":
@@ -440,6 +461,14 @@ def main(args):
             if task_id > 0:
                 # (argsに --lr_balance と --epochs_balance を追加する必要あり)
                 balance_classifier(args, model, proto_manager, data, task_id, taskcla)"""
+            # ============================================================
+            # ★追加: タスク選択ネットワークの更新
+            # ============================================================
+            print("Updating Proto Statistics for Generative Replay...")
+            update_proto_statistics(args, model, proto_manager, data, task_id)
+            
+            train_task_selector(args, model, task_selector, proto_manager, data, task_id, epochs=20)
+            # ============================================================
 
         # save accuracy
         jj = 0
@@ -466,6 +495,12 @@ def main(args):
             print(f"  -> Task-wise CIL Accs: [{', '.join(task_accs_str)}]")
             print(cil_acc_matrix)
         analyze_head_outputs(args, model, device, data, task_id, taskcla)
+        # ★追加: Task Selector を使った最終評価 (Class-IL Accuracy)
+        print("Compute Class Incremental Accuracy using Task Selector...")
+        ts_acc, ts_task_accs = evaluate_with_selector(args, model, task_selector, data, task_id, taskcla)
+        
+        print(f"Task {task_id} - Task Selector CIL Acc: {ts_acc:.2f}%")
+        print(f"  -> Details: {ts_task_accs}")
         print("Accuracies =")
         for i in range(task_id + 1):
             print("\t", end="")
