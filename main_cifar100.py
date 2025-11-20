@@ -38,6 +38,8 @@ def main(args):
         acc_matrix = np.zeros((10, 10))
         # ★追加: CIL用行列 (行: 学習完了タスクID, 列: 評価対象タスクID)
         cil_acc_matrix = np.zeros((10, 10))
+        # ★追加: タスク選択ネットワーク(Selector)用の行列
+        ts_acc_matrix = np.zeros((10, 10))
     elif args.dataset == "cifar100-20":
         from dataloader import cifar100 as cf100
 
@@ -501,6 +503,27 @@ def main(args):
         
         print(f"Task {task_id} - Task Selector CIL Acc: {ts_acc:.2f}%")
         print(f"  -> Details: {ts_task_accs}")
+        # 返ってきたリスト(0〜current_taskまでの精度)を行列の該当行に保存
+        # ts_task_accs は [Acc_Task0, Acc_Task1, ..., Acc_TaskCurrent] のリスト
+        ts_acc_matrix[task_id, :len(ts_task_accs)] = np.array(ts_task_accs)
+        
+        print(f"Task {task_id} - Task Selector CIL Acc: {ts_acc:.2f}%")
+        print(f"  -> Details: {ts_task_accs}")
+        # ★追加: Task Selector Accuracy Matrix の表示
+        print("-" * 50)
+        print("Task Selector Accuracies (CIL) =")
+        # 現在のタスク(task_id)までの行を表示
+        for i in range(task_id + 1):
+            print(f"Task {i} | ", end="")
+            for j in range(ts_acc_matrix.shape[1]):
+                # まだ到達していないタスクや値が0の箇所は 0.00% と表示される
+                val = ts_acc_matrix[i, j]
+                if val == 0 and j > i: # 未来のタスクは見やすく空欄にする場合
+                    print("   -   ", end="")
+                else:
+                    print("{:5.2f}% ".format(val), end="")
+            print()
+        print("-" * 50)
         print("Accuracies =")
         for i in range(task_id + 1):
             print("\t", end="")
