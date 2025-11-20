@@ -272,7 +272,7 @@ def main(args):
             update_proto_statistics(args, model, proto_manager, data, task_id)
             
             # 2. Task Selector の学習 (Current Data + Generated Old Data)
-            train_task_selector(args, model, task_selector, proto_manager, data, task_id, epochs=20)
+            train_task_selector(args, model, task_selector, proto_manager, data, task_id, taskcla,epochs=20)
             
             # ============================================================
 
@@ -469,7 +469,7 @@ def main(args):
             print("Updating Proto Statistics for Generative Replay...")
             update_proto_statistics(args, model, proto_manager, data, task_id)
             
-            train_task_selector(args, model, task_selector, proto_manager, data, task_id, epochs=20)
+            train_task_selector(args, model, task_selector, proto_manager, data, task_id,taskcla, epochs=20)
             # ============================================================
 
         # save accuracy
